@@ -15,7 +15,6 @@ from disnake.ext import commands
 from typing import TypeAlias
 from requests import post
 
-
 ActivityTypes: TypeAlias = (
     disnake.Activity
     | disnake.Game
@@ -86,10 +85,10 @@ cur = conn.cursor()
 
 
 async def link_player_game(userid: int, game_name: str):
-    
+
     if is_blacklisted(userid, game_name):
         return
-    
+
     cur.execute(
         """
     INSERT OR IGNORE INTO player_games(player, game)
@@ -125,9 +124,10 @@ def add_game(game_name: str):
 
 async def add_link_game(activity: ActivityTypes | None, member: disnake.Member):
     if activity and activity.type is disnake.ActivityType.playing and activity.name:
-        if add_game(activity.name):
-            add_colour(activity.name)
-        await link_player_game(member.id, activity.name)
+        game_name = resolve_game(activity.name)
+        if add_game(game_name):
+            add_colour(game_name)
+        await link_player_game(member.id, game_name)
 
 
 def add_colour(game_name: str):
@@ -176,6 +176,14 @@ def sql_setup():
     )
     """)
 
+    cur.execute("""
+CREATE TABLE IF NOT EXISTS game_aliases (
+    alias TEXT PRIMARY KEY,
+    game INTEGER NOT NULL,
+    FOREIGN KEY (game) REFERENCES games(id)
+)
+""")
+
     conn.commit()
 
 
@@ -192,19 +200,22 @@ def game_exists(game_name: str) -> bool:
     return bool(cur.fetchone()[0])
 
 
-
 def blacklist_game(userid: int, game_name: str):
-    cur.execute("""
+    cur.execute(
+        """
     INSERT OR IGNORE INTO blacklisted_games(player, game)
     SELECT players.id, games.id
     FROM players, games
     WHERE players.userid = ? AND games.name = ?
-    """, (userid, game_name))
+    """,
+        (userid, game_name),
+    )
     conn.commit()
 
 
 def unblacklist_game(userid: int, game_name: str):
-    cur.execute("""
+    cur.execute(
+        """
     DELETE FROM blacklisted_games
     WHERE player = (
         SELECT id FROM players WHERE userid = ?
@@ -212,12 +223,15 @@ def unblacklist_game(userid: int, game_name: str):
     AND game = (
         SELECT id FROM games WHERE name = ?
     )
-    """, (userid, game_name))
+    """,
+        (userid, game_name),
+    )
     conn.commit()
 
 
 def is_blacklisted(userid: int, game_name: str) -> bool:
-    cur.execute("""
+    cur.execute(
+        """
     SELECT EXISTS(
         SELECT 1
         FROM blacklisted_games bg
@@ -225,34 +239,44 @@ def is_blacklisted(userid: int, game_name: str) -> bool:
         JOIN games g ON bg.game = g.id
         WHERE p.userid = ? AND g.name = ?
     )
-    """, (userid, game_name))
+    """,
+        (userid, game_name),
+    )
 
     return bool(cur.fetchone()[0])
 
+
 def get_user_games(userid: int):
-    cur.execute("""
+    cur.execute(
+        """
     SELECT g.name
     FROM games g
     JOIN player_games pg ON g.id = pg.game
     JOIN players p ON p.id = pg.player
     WHERE p.userid = ?
     ORDER BY g.name
-    """, (userid,))
+    """,
+        (userid,),
+    )
 
     return [row[0] for row in cur.fetchall()]
 
 
 def get_user_blacklisted_games(userid: int):
-    cur.execute("""
+    cur.execute(
+        """
     SELECT g.name
     FROM games g
     JOIN blacklisted_games bg ON g.id = bg.game
     JOIN players p ON p.id = bg.player
     WHERE p.userid = ?
     ORDER BY g.name
-    """, (userid,))
+    """,
+        (userid,),
+    )
 
     return [row[0] for row in cur.fetchall()]
+
 
 def get_userids_for_game(game_name: str):
     cur.execute(
@@ -268,8 +292,45 @@ def get_userids_for_game(game_name: str):
 
     return [row[0] for row in cur.fetchall()]
 
+def migrate_game_links(alias_name: str, parent_name: str):
+    cur.execute("""
+    INSERT OR IGNORE INTO player_games(player, game)
+    SELECT pg.player, parent.id
+    FROM player_games pg
+    JOIN games alias ON alias.id = pg.game
+    JOIN games parent
+    WHERE alias.name = ?
+      AND parent.name = ?
+    """, (alias_name, parent_name))
+
+    cur.execute("""
+    DELETE FROM player_games
+    WHERE game = (
+        SELECT id
+        FROM games
+        WHERE name = ?
+    )
+    """, (alias_name,))
+
+    conn.commit()
+
 def normalize_game_name(name: str) -> str:
-    return re.sub(r'[^a-z0-9]', '', name.lower())
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+def resolve_game(name: str) -> str:
+    cur.execute("""
+    SELECT g.name
+    FROM game_aliases a
+    JOIN games g ON a.game = g.id
+    WHERE a.alias = ?
+    """, (name,))
+
+    row = cur.fetchone()
+
+    if row:
+        return row[0]
+
+    return name
 
 def fuzzy_filter(search: str, options: list[str]):
     if not search:
@@ -278,16 +339,14 @@ def fuzzy_filter(search: str, options: list[str]):
     normalized_search = normalize_game_name(search)
 
     contains = [
-        option
-        for option in options
-        if normalized_search in normalize_game_name(option)
+        option for option in options if normalized_search in normalize_game_name(option)
     ]
 
     matches = difflib.get_close_matches(
         normalized_search,
         [normalize_game_name(option) for option in options],
         n=25,
-        cutoff=0.1
+        cutoff=0.1,
     )
 
     fuzzy_matches = []
@@ -296,6 +355,7 @@ def fuzzy_filter(search: str, options: list[str]):
             fuzzy_matches.append(option)
 
     return list(dict.fromkeys(contains + fuzzy_matches))[:25]
+
 
 @bot.event
 async def on_ready():
@@ -340,7 +400,7 @@ async def remove_role(inter: disnake.ApplicationCommandInteraction, game: str):
     if role is None:
         await inter.send(f"Could not find role with id {id} in discord")
         return
-    
+
     await role.delete()
 
     cur.execute("UPDATE games SET roleid=NULL WHERE name=?", (game,))
@@ -349,16 +409,13 @@ async def remove_role(inter: disnake.ApplicationCommandInteraction, game: str):
     await inter.send(f"Removed role {game}")
 
 
-
-
-
 @bot.slash_command(description="Adds the game to your account")
 async def assign_game(inter: disnake.ApplicationCommandInteraction, game: str):
     if game_exists(game):
         if is_blacklisted(inter.author.id, game):
             unblacklist_game(inter.author.id, game)
             await inter.channel.send(f"Removing {game} from your blacklist")
-            
+
         await link_player_game(inter.user.id, game)
     await inter.send(f"Linked {inter.author.display_name} to {game}")
 
@@ -369,6 +426,7 @@ async def add_role(
     game: str,
     hex_colour: str | None = None,
 ):
+    game = resolve_game(game)
     await inter.send(f"Creating {game} role")
     cur.execute("SELECT * FROM games WHERE name = ?", (game,))
     row = cur.fetchone()
@@ -419,6 +477,7 @@ async def add_role(
 
     await inter.channel.send("Created & Assigned role")
 
+
 @bot.slash_command(description="Prevent automatic role assignment for a game")
 async def blacklist(inter: disnake.ApplicationCommandInteraction, game: str):
 
@@ -434,7 +493,8 @@ async def blacklist(inter: disnake.ApplicationCommandInteraction, game: str):
             await inter.user.remove_roles(role)
 
     await inter.send(f"{game} has been added to your blacklist.")
-    
+
+
 @bot.slash_command(description="Allow automatic role assignment for a game")
 async def unblacklist(inter: disnake.ApplicationCommandInteraction, game: str):
 
@@ -443,39 +503,76 @@ async def unblacklist(inter: disnake.ApplicationCommandInteraction, game: str):
     await inter.send(f"{game} removed from your blacklist.")
 
 
-
 @bot.slash_command(description="Change the colour of an existing role")
-async def change_colour(inter: disnake.ApplicationCommandInteraction, game: str, hex_colour:str):
+async def change_colour(
+    inter: disnake.ApplicationCommandInteraction, game: str, hex_colour: str
+):
     cur.execute("SELECT roleid FROM games WHERE name=?", (game,))
     id = cur.fetchone()[0]
     if not id:
         await inter.send(f"Could not find role for {game} in database")
         return
-    
+
     role = inter.guild.get_role(id)
 
     if role is None:
         await inter.send(f"Could not find role with id {id} in discord")
         return
-    
+
     colour = disnake.Color.from_hex(hex_colour)
     cur.execute("UPDATE games SET color=? WHERE name=?", (colour.value, game))
     conn.commit()
-    
+
     await role.edit(color=colour)
     await inter.send("Updated role colour")
     
+
+@bot.slash_command()
+async def add_alias(
+    inter,
+    alias: str,
+    game: str
+):
+    cur.execute("SELECT roleid FROM games WHERE name=?", (game,))
+    id = cur.fetchone()[0]
+    if id:
+        await inter.send(f"Alias not added, {game} has a role (i cba to do it automatically)")
+        return
+    
+    cur.execute("SELECT roleid FROM games WHERE name=?", (alias,))
+    id = cur.fetchone()[0] 
+    if id:
+        await inter.send(f"Alias not added, {alias} has a role (i cba to do it automatically)")
+        return
+        
+    cur.execute("""
+    INSERT OR REPLACE INTO game_aliases(alias, game)
+    SELECT ?, id
+    FROM games
+    WHERE name = ?
+    """, (alias, game))
+
+    conn.commit()
+    
+    migrate_game_links(alias, game)
+
+    await inter.send(
+        f'"{alias}" now maps to "{game}"'
+    )
+
+
 @bot.slash_command(description="Prints info associated with the user")
 async def get_my_info(inter: disnake.ApplicationCommandInteraction):
     user_games = get_user_games(inter.author.id)
     blacklisted_games = get_user_blacklisted_games(inter.author.id)
-    
+
     await inter.send(f"""The following games are associated with you:
 {" | ".join(user_games)}""")
     if blacklisted_games:
         await inter.channel.send(f"""You have blacklisted the following games:
 {" | ".join(blacklisted_games)}""")
-        
+
+
 @change_colour.autocomplete("game")
 @remove_role.autocomplete("game")
 def remove_role_autocomplete(inter: disnake.ApplicationCommandInteraction, string: str):
@@ -487,6 +584,8 @@ def remove_role_autocomplete(inter: disnake.ApplicationCommandInteraction, strin
 
     return fuzzy_filter(string, games)
 
+@add_alias.autocomplete("game")
+@add_alias.autocomplete("alias")
 @add_role.autocomplete("game")
 def add_role_autocomplete(inter: disnake.ApplicationCommandInteraction, string: str):
     cur.execute("SELECT name FROM games WHERE roleid IS NULL")
@@ -496,6 +595,7 @@ def add_role_autocomplete(inter: disnake.ApplicationCommandInteraction, string: 
         games.append(game[0])
 
     return fuzzy_filter(string, games)
+
 
 @assign_game.autocomplete("game")
 def assign_game_autocomplete(inter: disnake.ApplicationCommandInteraction, string: str):
@@ -518,17 +618,13 @@ def blacklist_autocomplete(inter, string):
 
     blacklisted = set(get_user_blacklisted_games(inter.user.id))
 
-    return fuzzy_filter(
-        string,
-        sorted(games - blacklisted)
-    )
-    
+    return fuzzy_filter(string, sorted(games - blacklisted))
+
+
 @unblacklist.autocomplete("game")
 def unblacklist_autocomplete(inter, string):
-    return fuzzy_filter(
-        string,
-        get_user_blacklisted_games(inter.user.id)
-    )
+    return fuzzy_filter(string, get_user_blacklisted_games(inter.user.id))
+
 
 def refresh_igdb():
     print("Refresh token")
@@ -607,7 +703,6 @@ def get_igdb_cover(game_name: str):
         game_cover_url = "https:" + game_cover_url.replace("t_thumb", "t_cover_small")
         return game_cover_url
     return ""
-
 
 
 @bot.slash_command(description="Print IP address")
